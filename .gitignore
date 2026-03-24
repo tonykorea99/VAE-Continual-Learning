@@ -1,0 +1,7 @@
+# Ignore everything
+*
+
+# Only track these files
+!.gitignore
+!main_VAE_CIFAR10.py
+!main_VAE_MNIST.py
