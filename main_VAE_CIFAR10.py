@@ -101,6 +101,8 @@ Examples:
                         help='Training loss logging interval (default: 50)')
     parser.add_argument('--eval_interval', type=int, default=1000,
                         help='Full evaluation interval (default: 1000)')
+    parser.add_argument('--forgetting_interval', type=int, default=0,
+                        help='Per-task forgetting eval interval; 0 = same as eval_interval')
 
     # --- W&B ---
     parser.add_argument('--project', type=str, default='VAE_CL_CIFAR10',
@@ -241,15 +243,20 @@ def parse_tasks(task_str, num_classes=NUM_CLASSES):
 #                  Generation Metrics / Per-Class / Visualizations)
 # ============================================================
 def evaluate(model, test_loader, metrics, device, args,
-             step, task_idx, fixed_x, fixed_y, lightweight=False):
+             step, task_idx, fixed_x, fixed_y, lightweight=False,
+             task_history=None):
     """
-    [REQ-1] Test Loss        — overall recon + kld on test set
+    [REQ-1] Test Loss        — All/recon_loss + kld on full test set (all 10 classes)
     [REQ-2] Recon Metrics    — SSIM, LPIPS, FID, IS  (x -> encode -> decode)
     [REQ-3] Gen Metrics      — FID, IS               (random z -> decode)
     [REQ-4] Per-Class        — recon loss + SSIM per class
-    [REQ-5] Visualizations   — GT vs Recon grid, per-class generation grid
+    [REQ-5] TaskPerf         — per-task group recon/SSIM to track forgetting
+                               e.g. TaskPerf/task0_recon during task1 training
+                               shows if task0 classes are being forgotten
+    [REQ-6] Visualizations   — GT vs Recon grid, per-class generation grid
 
     lightweight=True (sweep mode): Test Loss + SSIM only — skips FID/IS/LPIPS/Vis
+    task_history: list of class lists [[0..4], [5..9], ...] for tasks seen so far
     """
     model.eval()
     full = not lightweight
@@ -301,8 +308,9 @@ def evaluate(model, test_loader, metrics, device, args,
 
     # --- Log dict ---
     log = {
-        "Test/recon_loss":  test_recon / n_batch,
-        "Test/kld_loss":    test_kld / n_batch,
+        # All/recon_loss = full test set (all 10 classes) — explicit overall metric
+        "All/recon_loss":   test_recon / n_batch,
+        "All/kld_loss":     test_kld / n_batch,
         "Recon/SSIM":       recon_ssim / n_batch,
         "Meta/step":        step,
         "Meta/task":        task_idx,
@@ -315,6 +323,17 @@ def evaluate(model, test_loader, metrics, device, args,
             log[f"PerClass_Recon/{name}"] = np.mean(pc_recon[c])
         if pc_ssim[c]:
             log[f"PerClass_SSIM/{name}"] = np.mean(pc_ssim[c])
+
+    # [REQ-5] Per-task group metrics — key forgetting indicator
+    # TaskPerf/task0_recon going UP during task1 training = catastrophic forgetting
+    if task_history:
+        for t_idx, t_classes in enumerate(task_history):
+            t_recon = [v for c in t_classes for v in pc_recon[c]]
+            t_ssim  = [v for c in t_classes for v in pc_ssim[c]]
+            if t_recon:
+                log[f"TaskPerf/task{t_idx}_recon"] = np.mean(t_recon)
+            if t_ssim:
+                log[f"TaskPerf/task{t_idx}_ssim"]  = np.mean(t_ssim)
 
     if full:
         r_fid = metrics['fid'].compute().item()
@@ -434,10 +453,15 @@ def run_experiment(args, lightweight=False):
     anchor_model = None
     seen_classes = []
     global_step = 0
+    task_history = []  # grows as tasks are added: [[0..4], [5..9], ...]
 
-    # Initial eval (step 0)
+    # forgetting_interval: 0 means use same as eval_interval
+    forget_interval = args.forgetting_interval or args.eval_interval
+
+    # Initial eval (step 0, no task history yet)
     evaluate(model, test_loader, metrics, device, args,
-             0, 0, fixed_x, fixed_y, lightweight=lightweight)
+             0, 0, fixed_x, fixed_y, lightweight=lightweight,
+             task_history=[])
 
     for task_id, task_classes in enumerate(tasks):
         print(f"\n{'=' * 60}")
@@ -453,6 +477,7 @@ def run_experiment(args, lightweight=False):
         train_iter = iter(train_loader)
 
         seen_classes = seen_classes + task_classes
+        task_history = task_history + [task_classes]  # add before training starts
         model.train()
 
         pbar = tqdm(total=steps_per_task,
@@ -518,11 +543,11 @@ def run_experiment(args, lightweight=False):
                     "Meta/task":            task_id + 1,
                 })
 
-            # [REQ — Full Evaluation: test loss + all metrics]
+            # [REQ — Full Evaluation: test loss + all metrics + per-task forgetting]
             if global_step % args.eval_interval == 0:
                 evaluate(model, test_loader, metrics, device, args,
                          global_step, task_id + 1, fixed_x, fixed_y,
-                         lightweight=lightweight)
+                         lightweight=lightweight, task_history=task_history)
                 model.train()
 
         pbar.close()
@@ -536,7 +561,7 @@ def run_experiment(args, lightweight=False):
     # Final evaluation (always full — even in sweep, see the last trial's quality)
     evaluate(model, test_loader, metrics, device, args,
              global_step, len(tasks), fixed_x, fixed_y,
-             lightweight=lightweight)
+             lightweight=lightweight, task_history=task_history)
 
     print(f"\nExperiment finished. Total steps: {global_step}")
 
