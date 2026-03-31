@@ -105,10 +105,13 @@ Examples:
     parser.add_argument('--project', type=str, default='VAE_CL_MNIST',
                         help='W&B project name')
     parser.add_argument('--group', type=str, default='',
-                        help='W&B group name for organizing scenario runs. '
-                             'Auto-set to Scenario_{tasks} if empty.')
+                        help='W&B group name. Auto-set to Scenario_{tasks} if empty.')
     parser.add_argument('--run_name', type=str, default='',
                         help='W&B run name. Auto-set to {tasks}_{Proposed|Baseline}_lam{x} if empty.')
+    parser.add_argument('--scenarios', type=str, default='',
+                        help='Run all scenarios in one shot. '
+                             '"all" = 5-5,4-6,3-7,2-8,1-9,2x5 each with Proposed+Baseline. '
+                             'Or comma-separated subset e.g. "5-5,2x5"')
 
     # --- Sweep ---
     parser.add_argument('--sweep_count', type=int, default=18,
@@ -612,6 +615,25 @@ def run_sweep(args):
     wandb.agent(sweep_id, function=sweep_fn, count=args.sweep_count)
 
 
+# predefined scenario list
+ALL_SCENARIOS = ['5-5', '4-6', '3-7', '2-8', '1-9', '2x5']
+
+
+def run_one(args, tasks, use_replay, lambda_cl):
+    """Initialize W&B, run experiment, finish. One (tasks, mode) pair."""
+    trial = copy.copy(args)
+    trial.tasks      = tasks
+    trial.use_replay = use_replay
+    trial.lambda_cl  = lambda_cl
+    mode     = "Proposed" if use_replay else "Baseline"
+    run_name = args.run_name or f"{tasks}_{mode}_lam{lambda_cl}"
+    group    = args.group    or f"Scenario_{tasks}"
+    wandb.init(project=args.project, name=run_name, group=group,
+               config=vars(trial), reinit=True)
+    run_experiment(trial)
+    wandb.finish()
+
+
 # ============================================================
 # 7. Main
 # ============================================================
@@ -621,24 +643,36 @@ def main():
     print(f"{'=' * 60}")
     print(f"  CVAE Continual Learning — MNIST")
     print(f"  Run type : {args.runtype}")
-    print(f"  Tasks    : {args.tasks} -> {parse_tasks(args.tasks)}")
     print(f"  Device   : {args.device}")
     print(f"{'=' * 60}")
 
     if args.runtype == 'sweep':
         run_sweep(args)
-    elif args.runtype == 'train':
-        mode      = "Proposed" if args.use_replay else "Baseline"
-        run_name  = args.run_name  or f"{args.tasks}_{mode}_lam{args.lambda_cl}"
-        group     = args.group     or f"Scenario_{args.tasks}"
-        wandb.init(
-            project=args.project,
-            name=run_name,
-            group=group,
-            config=vars(args),
-        )
-        run_experiment(args)
-        wandb.finish()
+        return
+
+    # --scenarios: run all (tasks × {Proposed, Baseline}) in sequence
+    if args.scenarios:
+        task_list = (ALL_SCENARIOS if args.scenarios == 'all'
+                     else [s.strip() for s in args.scenarios.split(',')])
+        total = len(task_list) * 2
+        idx   = 0
+        for tasks in task_list:
+            for use_replay, lam in [(True, args.lambda_cl), (False, 0.0)]:
+                idx += 1
+                mode = "Proposed" if use_replay else "Baseline"
+                print(f"\n[{idx}/{total}] Scenario {tasks} — {mode}  "
+                      f"lambda={lam}  lr={args.lr}")
+                run_one(args, tasks, use_replay, lam)
+        return
+
+    # single run (original behaviour)
+    mode     = "Proposed" if args.use_replay else "Baseline"
+    run_name = args.run_name or f"{args.tasks}_{mode}_lam{args.lambda_cl}"
+    group    = args.group    or f"Scenario_{args.tasks}"
+    wandb.init(project=args.project, name=run_name, group=group,
+               config=vars(args))
+    run_experiment(args)
+    wandb.finish()
 
 
 if __name__ == "__main__":
