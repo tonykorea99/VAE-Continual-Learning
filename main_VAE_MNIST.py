@@ -104,6 +104,11 @@ Examples:
     # --- W&B ---
     parser.add_argument('--project', type=str, default='VAE_CL_MNIST',
                         help='W&B project name')
+    parser.add_argument('--group', type=str, default='',
+                        help='W&B group name for organizing scenario runs. '
+                             'Auto-set to Scenario_{tasks} if empty.')
+    parser.add_argument('--run_name', type=str, default='',
+                        help='W&B run name. Auto-set to {tasks}_{Proposed|Baseline}_lam{x} if empty.')
 
     # --- Sweep ---
     parser.add_argument('--sweep_count', type=int, default=18,
@@ -623,9 +628,13 @@ def main():
     if args.runtype == 'sweep':
         run_sweep(args)
     elif args.runtype == 'train':
+        mode      = "Proposed" if args.use_replay else "Baseline"
+        run_name  = args.run_name  or f"{args.tasks}_{mode}_lam{args.lambda_cl}"
+        group     = args.group     or f"Scenario_{args.tasks}"
         wandb.init(
             project=args.project,
-            name=f"{args.tasks}_lam{args.lambda_cl}_lr{args.lr}",
+            name=run_name,
+            group=group,
             config=vars(args),
         )
         run_experiment(args)
