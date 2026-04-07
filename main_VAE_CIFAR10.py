@@ -331,16 +331,16 @@ def evaluate(model, test_loader, metrics, device, args,
         if pc_ssim[c]:
             log[f"PerClass/ssim_{name}"] = np.mean(pc_ssim[c])
 
-    # [REQ-5] Per-task forgetting tracker
-    # TaskForgetting/task0_recon going UP during task1 training = catastrophic forgetting
+    # [REQ-5] Per-task forgetting tracker (1-indexed to match Meta/task)
+    # e.g. TaskForgetting/task1_recon rising while Meta/task=2 → task1 is being forgotten
     if task_history:
         for t_idx, t_classes in enumerate(task_history):
             t_recon = [v for c in t_classes for v in pc_recon[c]]
             t_ssim  = [v for c in t_classes for v in pc_ssim[c]]
             if t_recon:
-                log[f"TaskForgetting/task{t_idx}_recon"] = np.mean(t_recon)
+                log[f"TaskForgetting/task{t_idx + 1}_recon"] = np.mean(t_recon)
             if t_ssim:
-                log[f"TaskForgetting/task{t_idx}_ssim"]  = np.mean(t_ssim)
+                log[f"TaskForgetting/task{t_idx + 1}_ssim"]  = np.mean(t_ssim)
 
     if full:
         r_fid = metrics['fid'].compute().item()
