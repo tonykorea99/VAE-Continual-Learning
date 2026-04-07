@@ -101,8 +101,6 @@ Examples:
                         help='Training loss logging interval (default: 50)')
     parser.add_argument('--eval_interval', type=int, default=1000,
                         help='Full evaluation interval (default: 1000)')
-    parser.add_argument('--forgetting_interval', type=int, default=0,
-                        help='Per-task forgetting eval interval; 0 = same as eval_interval')
 
     # --- W&B ---
     parser.add_argument('--project', type=str, default='VAE_CL_CIFAR10',
@@ -252,7 +250,7 @@ def parse_tasks(task_str, num_classes=NUM_CLASSES):
 # ============================================================
 def evaluate(model, test_loader, metrics, device, args,
              step, task_idx, fixed_x, fixed_y, lightweight=False,
-             task_history=None):
+             task_history=None, wandb_step=None):
     """
     [REQ-1] Test Loss        — All/recon_loss + kld on full test set (all 10 classes)
     [REQ-2] Recon Metrics    — SSIM, LPIPS, FID, IS  (x -> encode -> decode)
@@ -400,7 +398,8 @@ def evaluate(model, test_loader, metrics, device, args,
                 vis_gen, caption=f"Rows=class 0-9, 8 samples each | Step {step}"),
         })
 
-    wandb.log(log)
+    # use explicit step so Train/ and TestLoss/ share the same x-axis in W&B
+    wandb.log(log, step=wandb_step if wandb_step is not None else step)
     model.train()
 
     if full:
@@ -466,13 +465,10 @@ def run_experiment(args, lightweight=False):
     global_step = 0
     task_history = []  # grows as tasks are added: [[0..4], [5..9], ...]
 
-    # forgetting_interval: 0 means use same as eval_interval
-    forget_interval = args.forgetting_interval or args.eval_interval
-
     # Initial eval (step 0, no task history yet)
     evaluate(model, test_loader, metrics, device, args,
              0, 0, fixed_x, fixed_y, lightweight=lightweight,
-             task_history=[])
+             task_history=[], wandb_step=0)
 
     for task_id, task_classes in enumerate(tasks):
         print(f"\n{'=' * 60}")
@@ -552,15 +548,15 @@ def run_experiment(args, lightweight=False):
                     "Train/kld_loss":       kld_loss.item(),
                     "Train/con_loss":       con_loss.item(),
                     "Train/kld_weight":     kld_w,
-                    "Meta/global_step":     global_step,
                     "Meta/task":            task_id + 1,
-                })
+                }, step=global_step)
 
             # [REQ — Full Evaluation: test loss + all metrics + per-task forgetting]
             if global_step % args.eval_interval == 0:
                 evaluate(model, test_loader, metrics, device, args,
                          global_step, task_id + 1, fixed_x, fixed_y,
-                         lightweight=lightweight, task_history=task_history)
+                         lightweight=lightweight, task_history=task_history,
+                         wandb_step=global_step)
                 model.train()
 
         pbar.close()
@@ -574,7 +570,8 @@ def run_experiment(args, lightweight=False):
     # Final evaluation (always full — even in sweep, see the last trial's quality)
     evaluate(model, test_loader, metrics, device, args,
              global_step, len(tasks), fixed_x, fixed_y,
-             lightweight=lightweight, task_history=task_history)
+             lightweight=lightweight, task_history=task_history,
+             wandb_step=global_step)
 
     print(f"\nExperiment finished. Total steps: {global_step}")
 
