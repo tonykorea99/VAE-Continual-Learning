@@ -320,10 +320,11 @@ def evaluate(model, test_loader, metrics, device, args,
 
     # --- Log dict ---
     log = {
-        # All/recon_loss = full test set (all 10 classes) — explicit overall metric
-        "All/recon_loss":   test_recon / n_batch,
-        "All/kld_loss":     test_kld / n_batch,
-        "Recon/SSIM":       recon_ssim / n_batch,
+        # TestLoss: MSE/KLD evaluated on full test set (all 10 classes) — mirrors Train/recon_loss
+        "TestLoss/recon":   test_recon / n_batch,
+        "TestLoss/kld":     test_kld / n_batch,
+        # ReconQuality: perceptual metrics for x -> encode -> decode reconstruction
+        "ReconQuality/SSIM": recon_ssim / n_batch,
         "Meta/step":        step,
         "Meta/task":        task_idx,
     }
@@ -332,20 +333,20 @@ def evaluate(model, test_loader, metrics, device, args,
     for c in range(NUM_CLASSES):
         name = CLASS_NAMES[c]
         if pc_recon[c]:
-            log[f"PerClass_Recon/{name}"] = np.mean(pc_recon[c])
+            log[f"PerClass/recon_{name}"] = np.mean(pc_recon[c])
         if pc_ssim[c]:
-            log[f"PerClass_SSIM/{name}"] = np.mean(pc_ssim[c])
+            log[f"PerClass/ssim_{name}"] = np.mean(pc_ssim[c])
 
-    # [REQ-5] Per-task group metrics — key forgetting indicator
-    # TaskPerf/task0_recon going UP during task1 training = catastrophic forgetting
+    # [REQ-5] Per-task forgetting tracker
+    # TaskForgetting/task0_recon going UP during task1 training = catastrophic forgetting
     if task_history:
         for t_idx, t_classes in enumerate(task_history):
             t_recon = [v for c in t_classes for v in pc_recon[c]]
             t_ssim  = [v for c in t_classes for v in pc_ssim[c]]
             if t_recon:
-                log[f"TaskPerf/task{t_idx}_recon"] = np.mean(t_recon)
+                log[f"TaskForgetting/task{t_idx}_recon"] = np.mean(t_recon)
             if t_ssim:
-                log[f"TaskPerf/task{t_idx}_ssim"]  = np.mean(t_ssim)
+                log[f"TaskForgetting/task{t_idx}_ssim"]  = np.mean(t_ssim)
 
     if full:
         r_fid = metrics['fid'].compute().item()
@@ -390,11 +391,13 @@ def evaluate(model, test_loader, metrics, device, args,
                 torch.cat(gen_imgs), nrow=8)
 
         log.update({
-            "Recon/LPIPS":      recon_lpips / n_batch,
-            "Recon/FID":        r_fid,
-            "Recon/IS":         r_is,
-            "Gen/FID":          g_fid,
-            "Gen/IS":           g_is,
+            # ReconQuality: perceptual metrics for x -> encode -> decode
+            "ReconQuality/LPIPS":  recon_lpips / n_batch,
+            "ReconQuality/FID":    r_fid,
+            "ReconQuality/IS":     r_is,
+            # GenQuality: perceptual metrics for random z -> decode
+            "GenQuality/FID":      g_fid,
+            "GenQuality/IS":       g_is,
             "Vis/GT_vs_Recon": wandb.Image(
                 vis_recon, caption=f"Top:GT Bottom:Recon | Step {step}"),
             "Vis/Generated_PerClass": wandb.Image(
@@ -488,8 +491,9 @@ def run_experiment(args, lightweight=False):
             batch_size=args.batch_size, shuffle=True, drop_last=True)
         train_iter = iter(train_loader)
 
-        seen_classes = seen_classes + task_classes
-        task_history = task_history + [task_classes]  # add before training starts
+        prev_classes  = list(seen_classes)            # snapshot BEFORE adding current task
+        seen_classes  = seen_classes + task_classes   # full seen (for anchor update ref)
+        task_history  = task_history + [task_classes] # add before training (for forgetting tracker)
         model.train()
 
         pbar = tqdm(total=steps_per_task,
@@ -505,11 +509,12 @@ def run_experiment(args, lightweight=False):
 
             x, y = x.to(device), y.to(device)
 
-            # Generative Replay
-            if args.use_replay and anchor_model is not None:
+            # Generative Replay — sample only from PREVIOUS task classes
+            # (anchor was trained on prev tasks only; sampling current task → garbage images)
+            if args.use_replay and anchor_model is not None and prev_classes:
                 bs = x.size(0)
                 y_rep = torch.tensor(
-                    np.random.choice(seen_classes, size=bs),
+                    np.random.choice(prev_classes, size=bs),
                     device=device)
                 z_rep = torch.randn(bs, args.latent_dim, device=device)
                 with torch.no_grad():
@@ -585,7 +590,7 @@ def run_sweep(args):
     sweep_config = {
         'method': 'bayes',
         'metric': {
-            'name': 'Test/recon_loss',
+            'name': 'TestLoss/recon',
             'goal': 'minimize',
         },
         'parameters': {
