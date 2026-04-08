@@ -254,7 +254,7 @@ def parse_tasks(task_str, num_classes=NUM_CLASSES):
 # ============================================================
 def evaluate(model, test_loader, metrics, device, args,
              step, task_idx, fixed_x, fixed_y, lightweight=False,
-             task_history=None, wandb_step=None):
+             task_history=None, wandb_step=None, seen_classes=None):
     """
     [REQ-1] Test Loss        — All/recon_loss + kld on full test set (all 10 classes)
     [REQ-2] Recon Metrics    — SSIM, LPIPS, FID, IS  (x -> encode -> decode)
@@ -350,16 +350,23 @@ def evaluate(model, test_loader, metrics, device, args,
         r_fid = metrics['fid'].compute().item()
         r_is = metrics['is'].compute()[0].item()
 
-        # --- Phase 2: Generation Metrics (random z -> decode) ---
+        # only generate from classes the model has actually been trained on
+        gen_classes = sorted(seen_classes) if seen_classes else list(range(NUM_CLASSES))
+
+        # --- Phase 2: Generation Metrics (random z -> decode, seen classes only) ---
         metrics['fid'].reset()
         metrics['is'].reset()
 
         with torch.no_grad():
+            # real reference: only seen-class images from test set
             for x, y in test_loader:
-                xu8 = (to_3ch(x.to(device)) * 255).byte()
-                metrics['fid'].update(xu8, real=True)
+                x, y = x.to(device), y.to(device)
+                mask = torch.tensor([t.item() in gen_classes for t in y], device=device)
+                if mask.sum() > 0:
+                    xu8 = (to_3ch(x[mask]) * 255).byte()
+                    metrics['fid'].update(xu8, real=True)
 
-            for c in range(NUM_CLASSES):
+            for c in gen_classes:
                 z = torch.randn(100, args.latent_dim, device=device)
                 yc = torch.full((100,), c, dtype=torch.long, device=device)
                 yoh = F.one_hot(yc, NUM_CLASSES).float()
@@ -379,27 +386,28 @@ def evaluate(model, test_loader, metrics, device, args,
             rc_grid = torchvision.utils.make_grid(fx_recon[:n], nrow=8)
             vis_recon = torch.cat([gt_grid, rc_grid], dim=1)
 
+            # generate only from seen classes — unseen classes not yet learned
             gen_imgs = []
-            for c in range(NUM_CLASSES):
+            for c in gen_classes:
                 z = torch.randn(8, args.latent_dim, device=device)
                 yc = torch.full((8,), c, dtype=torch.long, device=device)
                 yoh = F.one_hot(yc, NUM_CLASSES).float()
                 gen_imgs.append(model.decode(z, yoh))
-            vis_gen = torchvision.utils.make_grid(
-                torch.cat(gen_imgs), nrow=8)
+            vis_gen = torchvision.utils.make_grid(torch.cat(gen_imgs), nrow=8)
+            class_label = ','.join(CLASS_NAMES[c] for c in gen_classes)
 
         log.update({
             # ReconQuality: perceptual metrics for x -> encode -> decode
             "ReconQuality/LPIPS":  recon_lpips / n_batch,
             "ReconQuality/FID":    r_fid,
             "ReconQuality/IS":     r_is,
-            # GenQuality: perceptual metrics for random z -> decode
+            # GenQuality: random z -> decode, seen classes only
             "GenQuality/FID":      g_fid,
             "GenQuality/IS":       g_is,
             "Vis/GT_vs_Recon": wandb.Image(
                 vis_recon, caption=f"Top:GT Bottom:Recon | Step {step}"),
-            "Vis/Generated_PerClass": wandb.Image(
-                vis_gen, caption=f"Rows=digit 0-9, 8 samples each | Step {step}"),
+            "Vis/Generated_SeenClasses": wandb.Image(
+                vis_gen, caption=f"Classes: {class_label} | Step {step}"),
         })
 
     # use explicit step so Train/ and TestLoss/ share the same x-axis in W&B
@@ -472,7 +480,7 @@ def run_experiment(args, lightweight=False):
     # Initial eval (step 0, no task history yet)
     evaluate(model, test_loader, metrics, device, args,
              0, 0, fixed_x, fixed_y, lightweight=lightweight,
-             task_history=[], wandb_step=0)
+             task_history=[], wandb_step=0, seen_classes=[])
 
     for task_id, task_classes in enumerate(tasks):
         print(f"\n{'=' * 60}")
@@ -561,7 +569,7 @@ def run_experiment(args, lightweight=False):
                 evaluate(model, test_loader, metrics, device, args,
                          global_step, task_id + 1, fixed_x, fixed_y,
                          lightweight=lightweight, task_history=task_history,
-                         wandb_step=global_step)
+                         wandb_step=global_step, seen_classes=seen_classes)
                 model.train()
 
         pbar.close()
@@ -576,7 +584,7 @@ def run_experiment(args, lightweight=False):
     evaluate(model, test_loader, metrics, device, args,
              global_step, len(tasks), fixed_x, fixed_y,
              lightweight=lightweight, task_history=task_history,
-             wandb_step=global_step)
+             wandb_step=global_step, seen_classes=seen_classes)
 
     print(f"\nExperiment finished. Total steps: {global_step}")
 
