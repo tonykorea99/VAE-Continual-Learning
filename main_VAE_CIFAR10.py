@@ -250,89 +250,129 @@ def parse_tasks(task_str, num_classes=NUM_CLASSES):
 # ============================================================
 def evaluate(model, test_loader, metrics, device, args,
              step, task_idx, fixed_x, fixed_y, lightweight=False,
-             task_history=None, wandb_step=None, seen_classes=None):
+             task_history=None, wandb_step=None, seen_classes=None,
+             current_task_classes=None):
     """
-    [REQ-1] Test Loss        — All/recon_loss + kld on full test set (all 10 classes)
-    [REQ-2] Recon Metrics    — SSIM, LPIPS, FID, IS  (x -> encode -> decode)
-    [REQ-3] Gen Metrics      — FID, IS               (random z -> decode)
-    [REQ-4] Per-Class        — recon loss + SSIM per class
-    [REQ-5] TaskPerf         — per-task group recon/SSIM to track forgetting
-                               e.g. TaskPerf/task0_recon during task1 training
-                               shows if task0 classes are being forgotten
-    [REQ-6] Visualizations   — GT vs Recon grid, per-class generation grid
+    All metrics computed ONLY on seen classes (classes model has been trained on).
 
-    lightweight=True (sweep mode): Test Loss + SSIM only — skips FID/IS/LPIPS/Vis
-    task_history: list of class lists [[0..4], [5..9], ...] for tasks seen so far
+    SeenLoss/recon,kld    — overall loss on seen classes
+    SeenRecon/SSIM,...    — perceptual metrics on seen classes (x→encode→decode)
+    CurrentTask/recon,ssim — performance on the task being trained RIGHT NOW
+                             (going down = currently learning)
+    PastTasks/recon,ssim  — performance on ALL previous task classes
+                             (going up = catastrophic forgetting)
+    TaskForgetting/task{n} — per-task breakdown (1-indexed)
+    PerClass/recon_{cls}  — per-class metrics for seen classes only
+    GenQuality/FID,IS     — random z → decode quality (seen classes only)
+    Vis/GT_vs_Recon       — reconstruction visualization (seen classes only)
+    Vis/Generated_SeenClasses — generation grid for seen classes
     """
     model.eval()
     full = not lightweight
 
-    # --- Phase 1: Test Loss + Reconstruction Metrics ---
+    seen_set    = set(seen_classes)          if seen_classes          else set()
+    cur_set     = set(current_task_classes)  if current_task_classes  else set()
+    past_set    = seen_set - cur_set
+
     if full:
         metrics['fid'].reset()
         metrics['is'].reset()
 
-    test_recon, test_kld, n_batch = 0.0, 0.0, 0
-    recon_ssim = 0.0
-    recon_lpips = 0.0
+    seen_recon, seen_kld, seen_ssim, seen_lpips = 0.0, 0.0, 0.0, 0.0
+    cur_recon,  cur_ssim,  cur_n  = 0.0, 0.0, 0
+    past_recon, past_ssim, past_n = 0.0, 0.0, 0
+    n_batch = 0
     pc_recon = defaultdict(list)
-    pc_ssim = defaultdict(list)
+    pc_ssim  = defaultdict(list)
 
     with torch.no_grad():
         for x, y in test_loader:
             x, y = x.to(device), y.to(device)
+
+            # filter to seen classes only — unseen classes have never been trained
+            if seen_set:
+                mask = torch.tensor([t.item() in seen_set for t in y], device=device)
+                if mask.sum() == 0:
+                    continue
+                x, y = x[mask], y[mask]
+            elif not seen_set:
+                # step 0: nothing seen yet, skip
+                continue
+
             recon, mu, logvar = model(x, y)
 
-            # [REQ-1] Test loss
-            test_recon += F.mse_loss(recon, x, reduction='sum').item() / x.size(0)
-            test_kld += (-0.5 * torch.sum(
+            seen_recon += F.mse_loss(recon, x, reduction='sum').item() / x.size(0)
+            seen_kld   += (-0.5 * torch.sum(
                 1 + logvar - mu.pow(2) - logvar.exp())).item() / x.size(0)
-            n_batch += 1
-
-            # [REQ-2] Overall recon SSIM
-            recon_ssim += metrics['ssim'](recon, x).item()
+            n_batch    += 1
+            seen_ssim  += metrics['ssim'](recon, x).item()
 
             if full:
-                # LPIPS
                 x64 = F.interpolate(x, size=(64, 64))
                 r64 = F.interpolate(recon, size=(64, 64))
-                recon_lpips += metrics['lpips'](r64, x64).item()
-
-                # Recon FID / IS
+                seen_lpips += metrics['lpips'](r64, x64).item()
                 xu8 = (x * 255).byte()
                 ru8 = (recon * 255).clamp(0, 255).byte()
                 metrics['fid'].update(xu8, real=True)
                 metrics['fid'].update(ru8, real=False)
                 metrics['is'].update(ru8)
 
-            # [REQ-4] Per-class recon loss & SSIM
-            for c in range(NUM_CLASSES):
+            # per-class (seen classes only)
+            for c in list(seen_set):
                 m = y == c
                 if m.sum() >= 2:
                     pc_recon[c].append(F.mse_loss(recon[m], x[m]).item())
                     pc_ssim[c].append(metrics['ssim'](recon[m], x[m]).item())
 
-    # --- Log dict ---
+            # CurrentTask: classes being trained right now
+            if cur_set:
+                cm = torch.tensor([t.item() in cur_set for t in y], device=device)
+                if cm.sum() >= 2:
+                    cur_recon += F.mse_loss(recon[cm], x[cm]).item()
+                    cur_ssim  += metrics['ssim'](recon[cm], x[cm]).item()
+                    cur_n     += 1
+
+            # PastTasks: classes from all previous tasks
+            if past_set:
+                pm = torch.tensor([t.item() in past_set for t in y], device=device)
+                if pm.sum() >= 2:
+                    past_recon += F.mse_loss(recon[pm], x[pm]).item()
+                    past_ssim  += metrics['ssim'](recon[pm], x[pm]).item()
+                    past_n     += 1
+
+    if n_batch == 0:
+        model.train()
+        return 0.0
+
     log = {
-        # TestLoss: MSE/KLD evaluated on full test set (all 10 classes) — mirrors Train/recon_loss
-        "TestLoss/recon":   test_recon / n_batch,
-        "TestLoss/kld":     test_kld / n_batch,
-        # ReconQuality: perceptual metrics for x -> encode -> decode reconstruction
-        "ReconQuality/SSIM": recon_ssim / n_batch,
-        "Meta/step":        step,
-        "Meta/task":        task_idx,
+        # overall seen-class loss (mirrors Train/recon_loss but on test set, seen only)
+        "SeenLoss/recon":  seen_recon / n_batch,
+        "SeenLoss/kld":    seen_kld   / n_batch,
+        "SeenRecon/SSIM":  seen_ssim  / n_batch,
+        "Meta/step":       step,
+        "Meta/task":       task_idx,
     }
 
-    # [REQ-4] Per-class
-    for c in range(NUM_CLASSES):
+    # CurrentTask — is the model learning the current task?
+    if cur_n > 0:
+        log["CurrentTask/recon"] = cur_recon / cur_n
+        log["CurrentTask/ssim"]  = cur_ssim  / cur_n
+
+    # PastTasks — is the model forgetting previous tasks?
+    # Proposed should keep this flat; Baseline will see this rise
+    if past_n > 0:
+        log["PastTasks/recon"] = past_recon / past_n
+        log["PastTasks/ssim"]  = past_ssim  / past_n
+
+    # PerClass — seen classes only
+    for c in list(seen_set):
         name = CLASS_NAMES[c]
         if pc_recon[c]:
             log[f"PerClass/recon_{name}"] = np.mean(pc_recon[c])
         if pc_ssim[c]:
-            log[f"PerClass/ssim_{name}"] = np.mean(pc_ssim[c])
+            log[f"PerClass/ssim_{name}"]  = np.mean(pc_ssim[c])
 
-    # [REQ-5] Per-task forgetting tracker (1-indexed to match Meta/task)
-    # e.g. TaskForgetting/task1_recon rising while Meta/task=2 → task1 is being forgotten
+    # TaskForgetting — per-task breakdown (1-indexed, matches Meta/task)
     if task_history:
         for t_idx, t_classes in enumerate(task_history):
             t_recon = [v for c in t_classes for v in pc_recon[c]]
@@ -344,27 +384,23 @@ def evaluate(model, test_loader, metrics, device, args,
 
     if full:
         r_fid = metrics['fid'].compute().item()
-        r_is = metrics['is'].compute()[0].item()
+        r_is  = metrics['is'].compute()[0].item()
 
-        # only generate from classes the model has actually been trained on
-        gen_classes = sorted(seen_classes) if seen_classes else list(range(NUM_CLASSES))
+        gen_classes = sorted(seen_set)
 
-        # --- Phase 2: Generation Metrics (random z -> decode, seen classes only) ---
+        # GenQuality: random z → decode (seen classes only)
         metrics['fid'].reset()
         metrics['is'].reset()
 
         with torch.no_grad():
-            # real reference: only seen-class images from test set
             for x, y in test_loader:
                 x, y = x.to(device), y.to(device)
-                mask = torch.tensor([t.item() in gen_classes for t in y], device=device)
+                mask = torch.tensor([t.item() in seen_set for t in y], device=device)
                 if mask.sum() > 0:
-                    xu8 = (x[mask] * 255).byte()
-                    metrics['fid'].update(xu8, real=True)
-
+                    metrics['fid'].update((x[mask] * 255).byte(), real=True)
             for c in gen_classes:
-                z = torch.randn(100, args.latent_dim, device=device)
-                yc = torch.full((100,), c, dtype=torch.long, device=device)
+                z   = torch.randn(100, args.latent_dim, device=device)
+                yc  = torch.full((100,), c, dtype=torch.long, device=device)
                 yoh = F.one_hot(yc, NUM_CLASSES).float()
                 gen = model.decode(z, yoh)
                 gu8 = (gen * 255).clamp(0, 255).byte()
@@ -372,55 +408,59 @@ def evaluate(model, test_loader, metrics, device, args,
                 metrics['is'].update(gu8)
 
         g_fid = metrics['fid'].compute().item()
-        g_is = metrics['is'].compute()[0].item()
+        g_is  = metrics['is'].compute()[0].item()
 
-        # --- Visualizations ---
+        # Vis: GT vs Recon — filter fixed samples to seen classes
         with torch.no_grad():
-            fx_recon, _, _ = model(fixed_x, fixed_y)
-            n = min(32, fixed_x.size(0))
-            gt_grid = torchvision.utils.make_grid(fixed_x[:n], nrow=8)
-            rc_grid = torchvision.utils.make_grid(fx_recon[:n], nrow=8)
-            vis_recon = torch.cat([gt_grid, rc_grid], dim=1)
+            seen_mask = torch.tensor(
+                [t.item() in seen_set for t in fixed_y], device=device)
+            fx = fixed_x[seen_mask][:32]
+            fy = fixed_y[seen_mask][:32]
+            if fx.size(0) > 0:
+                fx_recon, _, _ = model(fx, fy)
+                gt_grid  = torchvision.utils.make_grid(fx, nrow=8)
+                rc_grid  = torchvision.utils.make_grid(fx_recon, nrow=8)
+                vis_recon = torch.cat([gt_grid, rc_grid], dim=1)
+            else:
+                vis_recon = torch.zeros(3, 16, 16, device=device)
 
-            # generate only from seen classes — unseen classes not yet learned
+            # Generated_SeenClasses: one row per seen class, 8 samples
             gen_imgs = []
             for c in gen_classes:
-                z = torch.randn(8, args.latent_dim, device=device)
-                yc = torch.full((8,), c, dtype=torch.long, device=device)
+                z   = torch.randn(8, args.latent_dim, device=device)
+                yc  = torch.full((8,), c, dtype=torch.long, device=device)
                 yoh = F.one_hot(yc, NUM_CLASSES).float()
                 gen_imgs.append(model.decode(z, yoh))
-            vis_gen = torchvision.utils.make_grid(torch.cat(gen_imgs), nrow=8)
-            class_label = ','.join(CLASS_NAMES[c] for c in gen_classes)
+            vis_gen     = torchvision.utils.make_grid(torch.cat(gen_imgs), nrow=8)
+            class_label = ', '.join(CLASS_NAMES[c] for c in gen_classes)
 
         log.update({
-            # ReconQuality: perceptual metrics for x -> encode -> decode
-            "ReconQuality/LPIPS":  recon_lpips / n_batch,
-            "ReconQuality/FID":    r_fid,
-            "ReconQuality/IS":     r_is,
-            # GenQuality: random z -> decode, seen classes only
-            "GenQuality/FID":      g_fid,
-            "GenQuality/IS":       g_is,
+            "SeenRecon/LPIPS": seen_lpips / n_batch,
+            "SeenRecon/FID":   r_fid,
+            "SeenRecon/IS":    r_is,
+            "GenQuality/FID":  g_fid,
+            "GenQuality/IS":   g_is,
             "Vis/GT_vs_Recon": wandb.Image(
-                vis_recon, caption=f"Top:GT Bottom:Recon | Step {step}"),
+                vis_recon, caption=f"Top:GT  Bottom:Recon | seen={class_label} | Step {step}"),
             "Vis/Generated_SeenClasses": wandb.Image(
-                vis_gen, caption=f"Classes: {class_label} | Step {step}"),
+                vis_gen, caption=f"Seen classes: {class_label} | Step {step}"),
         })
 
-    # use explicit step so Train/ and TestLoss/ share the same x-axis in W&B
     wandb.log(log, step=wandb_step if wandb_step is not None else step)
     model.train()
 
-    if full:
-        print(f"  [Step {step}] "
-              f"TestRecon: {test_recon / n_batch:.4f} | "
-              f"SSIM: {recon_ssim / n_batch:.4f} | "
-              f"ReconFID: {r_fid:.1f} | GenFID: {g_fid:.1f}")
-    else:
-        print(f"  [Step {step}] "
-              f"TestRecon: {test_recon / n_batch:.4f} | "
-              f"SSIM: {recon_ssim / n_batch:.4f}")
+    if full and n_batch > 0:
+        past_str = f" | PastTasks: {past_recon/past_n:.4f}" if past_n > 0 else ""
+        cur_str  = f" | CurTask: {cur_recon/cur_n:.4f}"    if cur_n  > 0 else ""
+        print(f"  [Step {step}] SeenRecon: {seen_recon/n_batch:.4f}"
+              f" | SSIM: {seen_ssim/n_batch:.4f}"
+              f" | ReconFID: {r_fid:.1f} | GenFID: {g_fid:.1f}"
+              f"{cur_str}{past_str}")
+    elif n_batch > 0:
+        print(f"  [Step {step}] SeenRecon: {seen_recon/n_batch:.4f}"
+              f" | SSIM: {seen_ssim/n_batch:.4f}")
 
-    return test_recon / n_batch
+    return seen_recon / n_batch if n_batch > 0 else 0.0
 
 
 # ============================================================
@@ -564,7 +604,8 @@ def run_experiment(args, lightweight=False):
                 evaluate(model, test_loader, metrics, device, args,
                          global_step, task_id + 1, fixed_x, fixed_y,
                          lightweight=lightweight, task_history=task_history,
-                         wandb_step=global_step, seen_classes=seen_classes)
+                         wandb_step=global_step, seen_classes=seen_classes,
+                         current_task_classes=task_classes)
                 model.train()
 
         pbar.close()
@@ -579,7 +620,8 @@ def run_experiment(args, lightweight=False):
     evaluate(model, test_loader, metrics, device, args,
              global_step, len(tasks), fixed_x, fixed_y,
              lightweight=lightweight, task_history=task_history,
-             wandb_step=global_step, seen_classes=seen_classes)
+             wandb_step=global_step, seen_classes=seen_classes,
+             current_task_classes=tasks[-1])
 
     print(f"\nExperiment finished. Total steps: {global_step}")
 
